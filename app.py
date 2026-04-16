@@ -318,6 +318,7 @@ force_hourly_refresh()
 
 st.title("🏠 Domowy Tasker")
 st.markdown(
+    "<p class='welcome-note'>Mobile-first: zadania, deadline 24h, punkty, streak, admin</p>",
     unsafe_allow_html=True,
 )
 
