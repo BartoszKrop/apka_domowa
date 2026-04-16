@@ -75,7 +75,7 @@ def add_task(name, description, assignee, points):
             "name": name.strip(),
             "description": description.strip(),
             "assignee": assignee,
-            "points": int(points),
+            "points": points,
             "date_added": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
     )
@@ -85,6 +85,10 @@ def add_task(name, description, assignee, points):
 
 def complete_task(task_id, user_name):
     tasks = st.session_state.db["tasks"]
+    if user_name not in st.session_state.db["points"]:
+        st.error("Nieznany profil użytkownika. Wybierz profil ponownie.")
+        return
+
     task_to_complete = next((t for t in tasks if t["id"] == task_id), None)
     if not task_to_complete:
         return
@@ -100,8 +104,7 @@ def complete_task(task_id, user_name):
         },
     )
     st.session_state.db["history"] = st.session_state.db["history"][:50]
-    if user_name in st.session_state.db["points"]:
-        st.session_state.db["points"][user_name] += task_to_complete["points"]
+    st.session_state.db["points"][user_name] += task_to_complete["points"]
     save_data(st.session_state.db)
     st.toast(f"Super! +{task_to_complete['points']} pkt 🎉")
 
