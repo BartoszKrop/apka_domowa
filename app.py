@@ -616,7 +616,7 @@ if current_user in WORKERS:
     st.markdown("---")
 
 # =========================================================
-# DÓŁ: ranking/trend/historia (w tabach -> lepsze na mobile)
+# DÓŁ: ranking/trend/historia (taby)
 # =========================================================
 tabs = st.tabs(["🏆 Ranking", "📈 Trend", "🕒 Ostatnie akcje"])
 
@@ -696,4 +696,9 @@ with tabs[2]:
         for entry in history[:12]:
             overdue_note = " • ⛔ po terminie" if entry.get("was_overdue") else ""
             st.markdown(f"**{entry['name']}**")
-            st.caption(f"{
+            st.caption(
+                f"{entry['completed_by']} • +{entry['points']} pkt • {entry['date_completed']}{overdue_note}"
+            )
+
+st.markdown("---")
+st.caption("iPhone-ready • Auto-refresh: 1h • Deadline: 24h • Admin: full control")
