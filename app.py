@@ -100,7 +100,8 @@ def complete_task(task_id, user_name):
         },
     )
     st.session_state.db["history"] = st.session_state.db["history"][:50]
-    st.session_state.db["points"][user_name] = st.session_state.db["points"].get(user_name, 0) + task_to_complete["points"]
+    if user_name in st.session_state.db["points"]:
+        st.session_state.db["points"][user_name] += task_to_complete["points"]
     save_data(st.session_state.db)
     st.toast(f"Super! +{task_to_complete['points']} pkt 🎉")
 
@@ -154,7 +155,11 @@ if current_user == "Mama":
         if task_mode == "Ze spisu":
             task_name = st.selectbox("Wybierz zadanie", PRESET_TASKS)
         else:
-            task_name = st.text_input("Wpisz nazwę nowego zadania")
+            task_name = st.text_input(
+                "Wpisz nazwę nowego zadania",
+                placeholder="Np. Umycie naczyń po kolacji",
+                help="Wpisz krótką i jasną nazwę zadania.",
+            )
 
         task_desc = st.text_area("Opis (opcjonalnie)")
         task_assignee = st.selectbox("Dla kogo?", [GENERAL_TASK_LABEL, *WORKERS])
