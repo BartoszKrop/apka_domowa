@@ -1,13 +1,16 @@
 import json
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
+import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Domowa apka zadań", page_icon="🏠", layout="centered")
 
-# --- STAŁE ---
+# =========================================================
+# STAŁE
+# =========================================================
 DATA_FILE = "data.json"
 GENERAL_TASK_LABEL = "Ogólne (kto pierwszy, ten lepszy)"
 WORKERS = ["Bartek", "Tomek"]
@@ -26,9 +29,11 @@ PRESET_TASKS = [
 ]
 
 DEADLINE_HOURS = 24
+AUTO_REFRESH_SECONDS = 3600  # 1h
 
-
-# --- DANE ---
+# =========================================================
+# DANE
+# =========================================================
 def default_data():
     return {
         "tasks": [],
@@ -37,38 +42,44 @@ def default_data():
     }
 
 
+def dt_to_str(dt: datetime):
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def parse_dt(s: str):
+    return datetime.strptime(s, "%Y-%m-%d %H:%M")
+
+
 def normalize_data(data):
     data = data or {}
     data.setdefault("tasks", [])
     data.setdefault("history", [])
     data.setdefault("points", {})
 
-    # Migracja "Ja" -> "Bartek"
     if "Ja" in data["points"]:
         data["points"]["Bartek"] = data["points"].get("Bartek", 0) + data["points"].pop("Ja")
 
     for worker in WORKERS:
         data["points"].setdefault(worker, 0)
 
-    # tylko WORKERS zbierają punkty
     data["points"] = {k: v for k, v in data["points"].items() if k in WORKERS}
 
-    # migracje treści
     for task in data["tasks"]:
         if task.get("assignee") == "Ja":
             task["assignee"] = "Bartek"
 
-        # deadline migration for old tasks
-        if "deadline_at" not in task:
-            raw_added = task.get("created_at") or task.get("date_added")
-            try:
-                added_dt = datetime.strptime(raw_added, "%Y-%m-%d %H:%M")
-            except Exception:
-                added_dt = datetime.now()
-            task["created_at"] = added_dt.strftime("%Y-%m-%d %H:%M")
-            task["deadline_at"] = (added_dt + timedelta(hours=DEADLINE_HOURS)).strftime("%Y-%m-%d %H:%M")
+        if "created_at" not in task:
+            task["created_at"] = task.get("date_added", dt_to_str(datetime.now()))
 
-        # zasada: prywatne zadania = 0 pkt
+        if "deadline_at" not in task:
+            try:
+                created = parse_dt(task["created_at"])
+            except Exception:
+                created = datetime.now()
+                task["created_at"] = dt_to_str(created)
+            task["deadline_at"] = dt_to_str(created + timedelta(hours=DEADLINE_HOURS))
+
+        # prywatne zadania mają 0 pkt
         if task.get("assignee") in WORKERS:
             task["points"] = 0
 
@@ -94,28 +105,21 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
-# --- SESSION STATE ---
+# =========================================================
+# SESSION
+# =========================================================
 if "db" not in st.session_state:
     st.session_state.db = load_data()
 if "current_user" not in st.session_state:
     st.session_state.current_user = None
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
+if "task_mode" not in st.session_state:
+    st.session_state.task_mode = "Ze spisu"
 
-
-# --- HELPERY ---
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-
-def dt_to_str(dt: datetime):
-    return dt.strftime("%Y-%m-%d %H:%M")
-
-
-def parse_dt(dt_str: str):
-    return datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-
-
+# =========================================================
+# HELPERY
+# =========================================================
 def is_overdue(task):
     try:
         return datetime.now() > parse_dt(task["deadline_at"])
@@ -125,23 +129,66 @@ def is_overdue(task):
 
 def time_left_text(task):
     try:
-        deadline = parse_dt(task["deadline_at"])
-        diff = deadline - datetime.now()
-        if diff.total_seconds() <= 0:
+        diff = parse_dt(task["deadline_at"]) - datetime.now()
+        total = int(diff.total_seconds())
+        if total <= 0:
             return "⛔ Po terminie"
-        hours = int(diff.total_seconds() // 3600)
-        mins = int((diff.total_seconds() % 3600) // 60)
-        return f"⏳ Zostało: {hours}h {mins}m"
+        h = total // 3600
+        m = (total % 3600) // 60
+        return f"⏳ Zostało: {h}h {m}m"
     except Exception:
-        return "⏳ Brak danych o terminie"
+        return "⏳ Brak deadline"
 
 
-# --- AKCJE ---
+def now_str():
+    return dt_to_str(datetime.now())
+
+
+def force_hourly_refresh():
+    st.markdown(
+        f"""
+        <script>
+            setTimeout(function() {{
+                window.location.reload();
+            }}, {AUTO_REFRESH_SECONDS * 1000});
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def count_open_overdue_tasks(tasks):
+    return sum(1 for t in tasks if is_overdue(t))
+
+
+def get_streak_for_user(user: str, history: list):
+    """
+    Streak = ile kolejnych dni (licząc od dziś), w których user wykonał >=1 zadanie.
+    """
+    done_days = set()
+    for e in history:
+        if e.get("completed_by") == user:
+            try:
+                d = parse_dt(e["date_completed"]).date()
+                done_days.add(d)
+            except Exception:
+                continue
+
+    streak = 0
+    cursor = date.today()
+    while cursor in done_days:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+# =========================================================
+# AKCJE
+# =========================================================
 def add_task(name, description, assignee, points):
     created_at = datetime.now()
     deadline_at = created_at + timedelta(hours=DEADLINE_HOURS)
 
-    # prywatne zadania = 0 pkt
     if assignee in WORKERS:
         points = 0
 
@@ -153,7 +200,7 @@ def add_task(name, description, assignee, points):
             "assignee": assignee,
             "points": int(points),
             "created_at": dt_to_str(created_at),
-            "date_added": dt_to_str(created_at),  # zachowanie kompatybilności
+            "date_added": dt_to_str(created_at),
             "deadline_at": dt_to_str(deadline_at),
         }
     )
@@ -165,7 +212,7 @@ def complete_task(task_id, user_name):
     tasks = st.session_state.db["tasks"]
 
     if user_name not in st.session_state.db["points"]:
-        st.error("Nieznany profil użytkownika. Wybierz profil ponownie.")
+        st.error("Nieznany profil użytkownika.")
         return
 
     task_to_complete = next((t for t in tasks if t["id"] == task_id), None)
@@ -174,74 +221,73 @@ def complete_task(task_id, user_name):
 
     st.session_state.db["tasks"] = [t for t in tasks if t["id"] != task_id]
 
+    overdue = is_overdue(task_to_complete)
+    pts = int(task_to_complete.get("points", 0))
+
     st.session_state.db["history"].insert(
         0,
         {
             "name": task_to_complete["name"],
             "completed_by": user_name,
-            "points": int(task_to_complete["points"]),
-            "was_overdue": is_overdue(task_to_complete),
+            "points": pts,
+            "was_overdue": overdue,
             "date_completed": now_str(),
             "assignee": task_to_complete.get("assignee"),
         },
     )
-    st.session_state.db["history"] = st.session_state.db["history"][:50]
-
-    # punkty tylko dla zadań ogólnych (prywatne i tak mają 0)
-    st.session_state.db["points"][user_name] += int(task_to_complete["points"])
+    st.session_state.db["history"] = st.session_state.db["history"][:300]
+    st.session_state.db["points"][user_name] += pts
 
     save_data(st.session_state.db)
-    st.toast(f"Super! +{task_to_complete['points']} pkt 🎉")
+    st.toast(f"Super! +{pts} pkt 🎉")
 
 
-# --- STYL ---
+# =========================================================
+# STYLE
+# =========================================================
 st.markdown(
     """
     <style>
-        .stMainBlockContainer {padding-top: 1.2rem; max-width: 900px;}
-        .welcome-note {text-align: center; opacity: .9; margin-bottom: .8rem;}
+        .stMainBlockContainer {padding-top: 1.0rem; max-width: 1024px;}
+        .welcome-note {text-align: center; opacity: .95; margin-bottom: .7rem;}
         .pill {
             display: inline-block;
-            padding: 0.2rem 0.6rem;
+            padding: .20rem .55rem;
             border-radius: 999px;
-            font-size: 0.8rem;
-            font-weight: 600;
+            font-size: .75rem;
+            font-weight: 700;
             margin-right: .35rem;
         }
-        .pill-general {background: #e0f2fe; color: #075985;}
-        .pill-private {background: #f3e8ff; color: #6b21a8;}
-        .pill-overdue {background: #fee2e2; color: #991b1b;}
-        .task-box {
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 12px;
-            margin-bottom: 10px;
-            background: #ffffff;
+        .pill-general {background:#dbeafe; color:#1e40af;}
+        .pill-private {background:#f3e8ff; color:#6b21a8;}
+        .pill-overdue {background:#fee2e2; color:#991b1b;}
+        .card {
+            border:1px solid #e5e7eb; border-radius:14px; padding:12px;
+            margin-bottom:10px; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.04);
         }
-        .task-box-overdue {
-            border: 1px solid #ef4444 !important;
-            background: #fff1f2 !important;
-        }
-        .soft-card {
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 10px 12px;
-            margin-bottom: 8px;
-            background: #fafafa;
-        }
+        .card-overdue {border-color:#ef4444 !important; background:#fff1f2 !important;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🏠 Domowy Tasker")
-st.markdown("<p class='welcome-note'>Zadania domowe, terminy i punkty</p>", unsafe_allow_html=True)
+force_hourly_refresh()
 
-# --- LOGOWANIE ---
+# =========================================================
+# HEADER
+# =========================================================
+st.title("🏠 Domowy Tasker+")
+st.markdown(
+    "<p class='welcome-note'>Zadania domowe • deadline 24h • punkty • streak • panel admina</p>",
+    unsafe_allow_html=True,
+)
+
+# =========================================================
+# LOGOWANIE
+# =========================================================
 if st.session_state.current_user is None and not st.session_state.is_admin:
     st.subheader("Wybierz profil")
     c1, c2, c3, c4 = st.columns(4)
-
     with c1:
         if st.button("👑 Mama", use_container_width=True):
             st.session_state.current_user = "Mama"
@@ -262,13 +308,12 @@ if st.session_state.current_user is None and not st.session_state.is_admin:
     st.info("Najpierw wybierz profil.")
     st.stop()
 
-# ekran hasła admina
 if st.session_state.current_user == ADMIN_USER and not st.session_state.is_admin:
-    st.subheader("Logowanie Admin")
+    st.subheader("🔐 Logowanie Admin")
     with st.form("admin_login_form", clear_on_submit=True):
-        pwd = st.text_input("Hasło", type="password", placeholder="Wpisz hasło admina")
-        submitted = st.form_submit_button("Zaloguj jako Admin")
-        if submitted:
+        pwd = st.text_input("Hasło", type="password")
+        ok = st.form_submit_button("Zaloguj")
+        if ok:
             if pwd == ADMIN_PASSWORD:
                 st.session_state.is_admin = True
                 st.success("Zalogowano jako Admin ✅")
@@ -276,7 +321,7 @@ if st.session_state.current_user == ADMIN_USER and not st.session_state.is_admin
             else:
                 st.error("Niepoprawne hasło.")
 
-    if st.button("⬅️ Wróć do wyboru profilu"):
+    if st.button("⬅️ Wróć"):
         st.session_state.current_user = None
         st.session_state.is_admin = False
         st.rerun()
@@ -285,12 +330,11 @@ if st.session_state.current_user == ADMIN_USER and not st.session_state.is_admin
 current_user = st.session_state.current_user
 is_admin = st.session_state.is_admin
 
-# top bar
-left, right = st.columns([4, 1])
-with left:
+tl, tr = st.columns([4, 1])
+with tl:
     role = "Admin" if is_admin else current_user
     st.caption(f"Zalogowano jako: **{role}**")
-with right:
+with tr:
     if st.button("Wyloguj", use_container_width=True):
         st.session_state.current_user = None
         st.session_state.is_admin = False
@@ -298,47 +342,210 @@ with right:
 
 st.divider()
 
-# --- PANEL DODAWANIA ZADAŃ (MAMA + ADMIN) ---
-if current_user == "Mama" or is_admin:
-    st.header("Panel zarządzania zadaniami")
+# =========================================================
+# METRYKI
+# =========================================================
+open_tasks = st.session_state.db["tasks"]
+overdue_count = count_open_overdue_tasks(open_tasks)
+general_count = sum(1 for t in open_tasks if t.get("assignee") == GENERAL_TASK_LABEL)
+private_count = len(open_tasks) - general_count
 
-    task_mode = st.radio("Rodzaj zadania", ["Ze spisu", "Nowe zadanie"], horizontal=True)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("📌 Aktywne", len(open_tasks))
+m2.metric("⛔ Po terminie", overdue_count)
+m3.metric("🌐 Ogólne", general_count)
+m4.metric("👤 Prywatne", private_count)
+
+# streak
+s1, s2 = st.columns(2)
+bartek_streak = get_streak_for_user("Bartek", st.session_state.db["history"])
+tomek_streak = get_streak_for_user("Tomek", st.session_state.db["history"])
+s1.metric("🔥 Streak Bartek", f"{bartek_streak} dni")
+s2.metric("🔥 Streak Tomek", f"{tomek_streak} dni")
+
+st.markdown("---")
+
+# =========================================================
+# MAMA PANEL (tylko dodawanie)
+# =========================================================
+if current_user == "Mama":
+    st.subheader("➕ Panel Mamy — dodawanie zadań")
+
+    st.session_state.task_mode = st.radio(
+        "Rodzaj zadania",
+        ["Ze spisu", "Nowe zadanie"],
+        horizontal=True,
+        index=0 if st.session_state.task_mode == "Ze spisu" else 1,
+    )
 
     with st.form("add_task_form", clear_on_submit=True):
-        if task_mode == "Ze spisu":
-            task_name = st.selectbox("Wybierz zadanie z listy", PRESET_TASKS)
+        if st.session_state.task_mode == "Ze spisu":
+            task_name = st.selectbox("Wybierz zadanie", PRESET_TASKS)
         else:
-            task_name = st.text_input(
-                "Wpisz nazwę nowego zadania",
-                placeholder="Np. Umycie naczyń po kolacji",
-            )
+            task_name = st.text_input("Nazwa nowego zadania", placeholder="Np. Posprzątaj biurko")
 
-        task_desc = st.text_area("Opis (opcjonalnie)", placeholder="Dodatkowe wskazówki...")
-
+        task_desc = st.text_area("Opis (opcjonalnie)")
         c1, c2 = st.columns(2)
         with c1:
             task_assignee = st.selectbox("Dla kogo?", [GENERAL_TASK_LABEL, *WORKERS])
-
         with c2:
             if task_assignee == GENERAL_TASK_LABEL:
-                task_points = st.number_input("Punkty (zadanie ogólne)", min_value=1, value=10, step=1)
+                task_points = st.number_input("Punkty", min_value=1, value=10, step=1)
             else:
-                st.text_input("Punkty (zadanie prywatne)", value="0", disabled=True)
+                st.text_input("Punkty (prywatne)", value="0", disabled=True)
                 task_points = 0
 
-        st.caption(f"⏱️ Deadline ustawiany automatycznie: **{DEADLINE_HOURS}h** od dodania zadania.")
-
-        if st.form_submit_button("Dodaj zadanie ➕", use_container_width=True):
-            if not task_name or not task_name.strip():
+        st.caption(f"Deadline: {DEADLINE_HOURS}h od dodania")
+        if st.form_submit_button("Dodaj zadanie ✅", use_container_width=True):
+            if not task_name.strip():
                 st.error("Podaj nazwę zadania.")
             else:
                 add_task(task_name, task_desc, task_assignee, task_points)
                 st.rerun()
 
-# --- PANEL WYKONYWANIA (WORKERS) ---
+    st.markdown("---")
+
+# =========================================================
+# ADMIN PANEL (pełna kontrola)
+# =========================================================
+if is_admin:
+    st.subheader("🛡️ Panel Admina — kontrola")
+
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["⚙️ Punkty", "🗂️ Zarządzanie zadaniami", "🧾 Historia", "🧨 Narzędzia"]
+    )
+
+    with tab1:
+        st.markdown("### Edycja punktów użytkowników")
+        for w in WORKERS:
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                new_pts = st.number_input(
+                    f"Punkty: {w}",
+                    min_value=0,
+                    value=int(st.session_state.db["points"].get(w, 0)),
+                    step=1,
+                    key=f"points_{w}",
+                )
+            with c2:
+                st.write("")
+                if st.button(f"Zapisz {w}", key=f"save_points_{w}", use_container_width=True):
+                    st.session_state.db["points"][w] = int(new_pts)
+                    save_data(st.session_state.db)
+                    st.success(f"Zapisano punkty dla {w}")
+
+    with tab2:
+        st.markdown("### Aktywne zadania")
+        if not st.session_state.db["tasks"]:
+            st.info("Brak aktywnych zadań.")
+        else:
+            for task in sorted(st.session_state.db["tasks"], key=lambda t: parse_dt(t["deadline_at"])):
+                overdue = is_overdue(task)
+                st.markdown(f"**{task['name']}**")
+                st.caption(
+                    f"Dla: {task['assignee']} • pkt: {task['points']} • deadline: {task['deadline_at']} "
+                    + ("• ⛔ PO TERMINIE" if overdue else "")
+                )
+
+                ec1, ec2, ec3 = st.columns([2, 2, 1])
+                with ec1:
+                    # admin może zmienić assignee
+                    new_assignee = st.selectbox(
+                        "Zmień odbiorcę",
+                        [GENERAL_TASK_LABEL, *WORKERS],
+                        index=([GENERAL_TASK_LABEL, *WORKERS].index(task["assignee"]) if task["assignee"] in [GENERAL_TASK_LABEL, *WORKERS] else 0),
+                        key=f"asg_{task['id']}",
+                        label_visibility="collapsed",
+                    )
+                with ec2:
+                    # punkty tylko dla ogólnych
+                    if new_assignee == GENERAL_TASK_LABEL:
+                        new_points = st.number_input(
+                            "Punkty",
+                            min_value=1,
+                            value=max(1, int(task.get("points", 1))),
+                            step=1,
+                            key=f"pts_{task['id']}",
+                            label_visibility="collapsed",
+                        )
+                    else:
+                        st.text_input("Punkty", value="0", disabled=True, key=f"pts_dis_{task['id']}", label_visibility="collapsed")
+                        new_points = 0
+                with ec3:
+                    if st.button("💾", key=f"save_task_{task['id']}", use_container_width=True):
+                        task["assignee"] = new_assignee
+                        task["points"] = int(new_points) if new_assignee == GENERAL_TASK_LABEL else 0
+                        save_data(st.session_state.db)
+                        st.success("Zaktualizowano zadanie")
+                        st.rerun()
+
+                dc1, dc2 = st.columns([3, 1])
+                with dc1:
+                    extra_h = st.number_input(
+                        f"Dodaj godziny do deadline ({task['name']})",
+                        min_value=0,
+                        max_value=168,
+                        value=0,
+                        step=1,
+                        key=f"ext_{task['id']}",
+                    )
+                with dc2:
+                    st.write("")
+                    if st.button("⏱️ Przedłuż", key=f"extend_{task['id']}", use_container_width=True):
+                        if extra_h > 0:
+                            task["deadline_at"] = dt_to_str(parse_dt(task["deadline_at"]) + timedelta(hours=int(extra_h)))
+                            save_data(st.session_state.db)
+                            st.success("Deadline przedłużony")
+                            st.rerun()
+
+                if st.button("🗑️ Usuń zadanie", key=f"del_{task['id']}", use_container_width=True):
+                    st.session_state.db["tasks"] = [t for t in st.session_state.db["tasks"] if t["id"] != task["id"]]
+                    save_data(st.session_state.db)
+                    st.warning("Zadanie usunięte")
+                    st.rerun()
+
+                st.markdown("---")
+
+    with tab3:
+        st.markdown("### Historia (ostatnie 30)")
+        hist = st.session_state.db["history"][:30]
+        if not hist:
+            st.info("Brak historii.")
+        else:
+            for e in hist:
+                late = " • ⛔ po terminie" if e.get("was_overdue") else ""
+                st.markdown(f"**{e['name']}**")
+                st.caption(f"{e['completed_by']} • +{e['points']} pkt • {e['date_completed']}{late}")
+
+    with tab4:
+        st.markdown("### Narzędzia administracyjne")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("♻️ Reset punktów", use_container_width=True):
+                st.session_state.db["points"] = {w: 0 for w in WORKERS}
+                save_data(st.session_state.db)
+                st.success("Zresetowano punkty")
+                st.rerun()
+        with c2:
+            if st.button("🧹 Wyczyść historię", use_container_width=True):
+                st.session_state.db["history"] = []
+                save_data(st.session_state.db)
+                st.success("Historia wyczyszczona")
+                st.rerun()
+
+        if st.button("💣 Usuń wszystkie aktywne zadania", use_container_width=True):
+            st.session_state.db["tasks"] = []
+            save_data(st.session_state.db)
+            st.warning("Wszystkie zadania usunięte")
+            st.rerun()
+
+    st.markdown("---")
+
+# =========================================================
+# WORKER PANEL
+# =========================================================
 if current_user in WORKERS:
-    st.header(f"Cześć {current_user} 👋")
-    st.subheader("Twoje zadania")
+    st.subheader(f"🗂️ Zadania — {current_user}")
 
     tasks_to_show = [
         t for t in st.session_state.db["tasks"]
@@ -346,81 +553,97 @@ if current_user in WORKERS:
     ]
 
     if not tasks_to_show:
-        st.success("Na teraz brak zadań. Super robota 😎")
+        st.success("Brak aktywnych zadań 🎉")
     else:
-        # najpierw pilne i przeterminowane
         tasks_to_show = sorted(tasks_to_show, key=lambda t: parse_dt(t["deadline_at"]))
 
         for task in tasks_to_show:
             overdue = is_overdue(task)
-            assignee = task.get("assignee", GENERAL_TASK_LABEL)
-            is_general = assignee == GENERAL_TASK_LABEL
+            is_general = task["assignee"] == GENERAL_TASK_LABEL
+            cls = "card card-overdue" if overdue else "card"
 
-            box_cls = "task-box task-box-overdue" if overdue else "task-box"
-            st.markdown(f"<div class='{box_cls}'>", unsafe_allow_html=True)
+            st.markdown(f"<div class='{cls}'>", unsafe_allow_html=True)
 
             badges = []
-            if is_general:
-                badges.append("<span class='pill pill-general'>OGÓLNE</span>")
-            else:
-                badges.append("<span class='pill pill-private'>PRYWATNE</span>")
+            badges.append("<span class='pill pill-general'>OGÓLNE</span>" if is_general else "<span class='pill pill-private'>PRYWATNE</span>")
             if overdue:
                 badges.append("<span class='pill pill-overdue'>PO TERMINIE</span>")
-
             st.markdown("".join(badges), unsafe_allow_html=True)
+
             st.markdown(f"### {task['name']}")
             if task.get("description"):
                 st.caption(task["description"])
 
-            pts_text = f"{task['points']} pkt" if is_general else "0 pkt (zadanie prywatne)"
+            pts_txt = f"{task['points']} pkt" if is_general else "0 pkt (prywatne)"
             st.caption(
-                f"👤 Dla: {assignee} • 🪙 {pts_text} • "
-                f"🕒 Dodano: {task.get('created_at', task.get('date_added', '-'))} • "
-                f"📅 Deadline: {task.get('deadline_at', '-')}"
+                f"👤 Dla: {task['assignee']} • 🪙 {pts_txt} • "
+                f"🕒 Dodano: {task.get('created_at', '-')} • 📅 Deadline: {task.get('deadline_at', '-')}"
             )
             st.caption(time_left_text(task))
 
-            if st.button("Zrobione ✅", key=task["id"], use_container_width=True):
+            if st.button("Zrobione ✅", key=f"done_{task['id']}", use_container_width=True):
                 complete_task(task["id"], current_user)
                 st.rerun()
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-# ADMIN - podgląd wszystkich otwartych zadań
-if is_admin:
-    st.subheader("🛡️ Podgląd wszystkich aktywnych zadań")
-    all_tasks = st.session_state.db["tasks"]
-    if not all_tasks:
-        st.info("Brak aktywnych zadań.")
-    else:
-        for t in sorted(all_tasks, key=lambda x: parse_dt(x["deadline_at"])):
-            overdue = "🔴" if is_overdue(t) else "🟢"
-            st.markdown(
-                f"- {overdue} **{t['name']}** | dla: `{t['assignee']}` | "
-                f"pkt: `{t['points']}` | deadline: `{t['deadline_at']}`"
-            )
+    st.markdown("---")
 
-st.markdown("---")
+# =========================================================
+# RANKING + HISTORIA + WYKRESY
+# =========================================================
+left, right = st.columns([1, 1])
 
-# --- RANKING + HISTORIA ---
-score_col, history_col = st.columns(2)
-
-with score_col:
+with left:
     st.subheader("🏆 Ranking")
-    ranking = sorted(st.session_state.db["points"].items(), key=lambda item: item[1], reverse=True)
-    for place, (user, points) in enumerate(ranking):
-        medal = "🥇" if place == 0 else "🥈" if place == 1 else "🥉"
-        user_label = f"**{user}**" if user == current_user else user
-        st.markdown(f"{medal} {user_label}: **{points} pkt**")
+    ranking = sorted(st.session_state.db["points"].items(), key=lambda x: x[1], reverse=True)
+    for i, (user, pts) in enumerate(ranking):
+        medal = "🥇" if i == 0 else "🥈" if i == 1 else "🥉"
+        mark = "**" if user == current_user else ""
+        st.markdown(f"{medal} {mark}{user}{mark}: **{pts} pkt**")
 
-with history_col:
-    st.subheader("🕒 Ostatnie zadania")
-    if not st.session_state.db["history"]:
+    if ranking:
+        df_rank = pd.DataFrame(ranking, columns=["Użytkownik", "Punkty"])
+        st.caption("Aktualne punkty")
+        st.bar_chart(df_rank.set_index("Użytkownik"))
+
+with right:
+    st.subheader("📈 Trend punktów")
+    history = st.session_state.db["history"]
+
+    if not history:
         st.info("Brak historii.")
     else:
-        for entry in st.session_state.db["history"][:10]:
+        rows = []
+        for e in reversed(history):  # od najstarszych
+            who = e.get("completed_by")
+            if who in WORKERS:
+                try:
+                    dt = parse_dt(e.get("date_completed"))
+                except Exception:
+                    continue
+                rows.append({"datetime": dt, "user": who, "points": int(e.get("points", 0))})
+
+        if rows:
+            df = pd.DataFrame(rows).sort_values("datetime")
+            pivot_rows = []
+            cumulative = {w: 0 for w in WORKERS}
+            for _, r in df.iterrows():
+                cumulative[r["user"]] += int(r["points"])
+                row = {"datetime": r["datetime"]}
+                for w in WORKERS:
+                    row[w] = cumulative[w]
+                pivot_rows.append(row)
+
+            df_line = pd.DataFrame(pivot_rows).drop_duplicates(subset=["datetime"], keep="last")
+            if not df_line.empty:
+                st.line_chart(df_line.set_index("datetime")[WORKERS])
+
+        st.markdown("### 🕒 Ostatnie akcje")
+        for entry in history[:8]:
             overdue_note = " • ⛔ po terminie" if entry.get("was_overdue") else ""
             st.markdown(f"**{entry['name']}**")
-            st.caption(
-                f"{entry['completed_by']} • +{entry['points']} pkt • {entry['date_completed']}{overdue_note}"
-            )
+            st.caption(f"{entry['completed_by']} • +{entry['points']} pkt • {entry['date_completed']}{overdue_note}")
+
+st.markdown("---")
+st.caption("Auto-refresh: 1h • Deadline: 24h • Admin: pełna kontrola • Streak: aktywność dzienna")
